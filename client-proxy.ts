@@ -1,83 +1,101 @@
+// Importamos librería para hacer peticiones HTTP
 import fetch from "node-fetch";
 
-// Tipo que representa una entrada en el Naming Server
-// Cada entrada describe un servicio con host, puerto y (opcional) su interfaz
-type Entry = { host: string; port: number; iface?: string[]; };
+// ===============================
+// TIPO DE DATO Entry
+// ===============================
+// Representa una entrada obtenida desde el naming server
+// Cada servicio tiene: host, puerto y opcionalmente la interfaz (métodos que ofrece)
+type Entry = { host: string; port: number; iface?: string[] };
 
-// Cliente para conectarse al Naming Server
-// Permite buscar (lookup) y resolver (resolve) servicios por nombre
+// ===============================
+// CLIENTE DE NAMING SERVER
+// ===============================
+// Clase que permite consultar a un naming server para obtener la dirección
+// de un servicio registrado.
 class NamingClient {
-  public namingBase: string;
+   public namingBase: string;
 
-  // Constructor: recibe la URL base del naming server
+  // Constructor: recibe la URL base del naming server (ej: http://127.0.0.1:5000)
   constructor(namingBase = "http://127.0.0.1:5000") {
     this.namingBase = namingBase;
   }
 
-  // Busca un servicio por nombre en el naming server
-  // Devuelve un array con las entradas registradas
+  // Método lookup: busca un servicio por su nombre
+  // Devuelve un array de entradas [{host, port, iface}]
   async lookup(name: string): Promise<Entry[]> {
     const r = await fetch(`${this.namingBase}/lookup/${encodeURIComponent(name)}`);
     if (!r.ok) throw new Error(`lookup failed: ${r.status}`);
     const json = await r.json();
-    return json.entries; // ⚠️ importante: el array está dentro de "entries"
-  }
-
-  // Similar a lookup, pero puede devolver múltiples instancias vivas
-  async resolve(name: string): Promise<Entry[]> {
-    const r = await fetch(`${this.namingBase}/resolve/${encodeURIComponent(name)}`);
-    if (!r.ok) throw new Error(`resolve failed: ${r.status}`);
-    const json = await r.json();
-    return json.entries; // también está dentro de "entries"
+    return json.entries;
   }
 }
 
-// Construye un proxy dinámico para invocar métodos remotos
-function buildProxy(entry: Entry) {
-  const base = `http://${entry.host}:${entry.port}`; // host+puerto del servicio
+// ===============================
+// INTERFAZ DE LOS MÉTODOS REMOTOS
+// ===============================
+// Esto define cómo se espera que sea la "API" del servicio remoto.
+// No implementa nada, solo sirve para que TypeScript nos dé autocompletado y chequeos.
+interface RemoteCalc {
+  add(a: number, b: number): Promise<number>;
+  mul(a: number, b: number): Promise<number>;
+  echo(msg: string): Promise<string>;
+}
 
-  // Handler del Proxy: intercepta llamadas a propiedades
-  const handler: ProxyHandler<any> = {
+// ===============================
+// PROXY DINÁMICO
+// ===============================
+// Esta función construye un "proxy" que actúa como si fuera el servicio remoto.
+// Cuando llamamos a remote.add(2,3), en realidad manda una petición HTTP al servicio real.
+function buildProxy(entry: Entry): RemoteCalc {
+  const base = `http://${entry.host}:${entry.port}`;
+
+  return new Proxy({} as RemoteCalc, {
+    // "get" intercepta cualquier acceso a propiedades del objeto proxy
+    // Ejemplo: remote.add -> prop = "add"
     get(_, prop: string) {
-      // Cada propiedad accedida se interpreta como un método remoto
+      // Devolvemos una función async que enviará la invocación al servicio
       return async (...args: any[]) => {
-        // Llamada HTTP POST al endpoint /invoke del servicio
         const res = await fetch(`${base}/invoke`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          // Mandamos { method: "add", args: [2,3] }
           body: JSON.stringify({ method: prop, args })
         });
 
         const json = await res.json();
-
         if (!res.ok) throw new Error(json.error || "invoke error");
-
-        return json.result; // resultado del método remoto
+        return json.result;
       };
     }
-  };
-
-  return new Proxy({}, handler); // devolvemos el proxy "mágico"
+  });
 }
 
-// Ejemplo de uso del cliente
+// ===============================
+// EJEMPLO DE USO
+// ===============================
+// Flujo completo:
+// 1. Consultamos al naming server para encontrar el servicio "org.example.calc"
+// 2. Creamos un proxy dinámico para ese servicio
+// 3. Llamamos a sus métodos como si fueran locales
 (async () => {
-  const nc = new NamingClient(); // cliente hacia el naming server
+  // Creamos un cliente apuntando al naming server en 127.0.0.1:5000
+  const nc = new NamingClient("http://127.0.0.1:5000");
 
-  // 1) Buscamos el servicio "org.example.calc"
+  // Buscamos el servicio por nombre
   const entries = await nc.lookup("org.example.calc");
+  if (entries.length === 0) throw new Error("No se encontró el servicio");
 
-  if (entries.length === 0) throw new Error("no service"); // no hay servicio registrado
+  // Construimos un proxy con la primera entrada encontrada
+  const remote = buildProxy(entries[0]);
 
-  const entry = entries[0]; // tomamos la primera entrada
-
-  // 2) Construimos el proxy dinámico
-  const remote = buildProxy(entry);
-
-  // 3) Usamos el proxy como si fuera un objeto local
+  // Llamamos a métodos remotos como si fueran locales
   const sum = await remote.add(2, 3);
   console.log("2+3 =", sum);
 
-  const m = await remote.mul(4, 5);
-  console.log("4*5 =", m);
+  const mul = await remote.mul(4, 5);
+  console.log("4*5 =", mul);
+
+  const echo = await remote.echo("Hola mundo!");
+  console.log("Echo:", echo);
 })();

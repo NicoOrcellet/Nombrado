@@ -1,128 +1,137 @@
 import express from "express";
 import bodyParser from "body-parser";
+import fetch from "node-fetch";
 
-/*
-  Tipo que representa una entrada en el registro.
-  - name: nombre jerárquico del servicio (ej: "org.dept.svc")
-  - host, port: dónde está registrada la instancia
-  - type: "RPC" o "RMI"
-  - iface: Lista de métodos si es RMI
-  - meta: Cualquier metadato extra
-  - ttl: Tiempo de vida en segundos (lease). Si se pasa, el cliente debe renovar antes de que expire.
-  - registeredAt: timestamp (ms) de cuando se registró.
-*/
-type Entry = {
-  name: string; 
-  host: string;
-  port: number;
-  type: "rpc" | "rmi";
-  iface?: string[]; 
-  meta?: any;
-  ttl?: number; 
-  registeredAt: number;
-};
+// Tipo de dato que representa una entrada en el sistema de nombres
+// Un servicio está definido por su host, puerto y opcionalmente una interfaz (lista de métodos)
+type Entry = { host: string; port: number; iface?: string[] };
 
-//Crear el servidor HTTP.
+// Base de datos local de nombres (un simple objeto en memoria)
+// La clave es un string (ej: "org.example.calc")
+// El valor es un array de entradas [{host, port, iface}, ...]
+const namingDb: Record<string, Entry[]> = {};
+
+// Configuración del puerto donde corre este servidor de nombres
+// Primero intenta leer de variables de entorno (PORT), si no usa 5000 por defecto
+const PORT = Number(process.argv[2]) || process.env.PORT || 5000;
+
+// Lista de otros servidores de nombres conocidos
+// Así logramos un sistema jerárquico/distribuido de resolución
+// En un sistema real, esto debería venir de un archivo de configuración o servicio de descubrimiento
+const otherNamingServers = [
+  "http://127.0.0.1:6000",
+  "http://127.0.0.1:7000"
+];
+
+// Inicializamos la aplicación Express
 const app = express();
-
-// Obliga a que el cuerpo de la request contenga el objeto JS
-// parseado cuando Content-Type: application/json
-app.use(bodyParser.json());
-
-// Puerto donde corre el naming server
-const PORT = 5000;
-
-
-// Mapa de nombre -> lista de instancias
-// Se usa una lista para soportar múltiples réplicas/instancias del mismo servicio.
-const registry = new Map<string, Entry[]>();
-
-/*
-  Endpoint: POST /register
-  Body esperado: { name, host, port, type, iface?, meta?, ttl? }
-  Acción: agrega la entrada al registro, añadiendo registeredAt.
+app.use(bodyParser.json()); // Habilitamos lectura de JSON en las peticiones
+  
+/* 
+  ============================
+  ENDPOINT: REGISTRO DE SERVICIO
+  ============================
+  Un servicio se registra en este naming server enviando una petición POST a /register
+  Ejemplo:
+  POST /register
+  {
+    "name": "org.example.calc",
+    "host": "127.0.0.1",
+    "port": 4000,
+    "iface": ["add","mul"]
+  }
 */
 app.post("/register", (req, res) => {
-    // Se construye la entrada añadiendo registeredAt
-    const e: Entry = { ...req.body, registeredAt: Date.now() };
-    // Se valida el name, host y port, que son obligatorios
-    if (!e.name || !e.host || !e.port) return res.status(400).send("missing fields");
+  const { name, host, port, iface } = req.body;
 
-    // Se recupera la lista actual (en caso de que exista) y se añade la nueva instancia
-    const arr = registry.get(e.name) || [];
-    arr.push(e);
-    registry.set(e.name, arr);
+  // Validamos que vengan los campos obligatorios
+  if (!name || !host || !port) {
+    return res.status(400).json({ error: "falta name/host/port" });
+  }
 
-    //Respuesta: ok :)
-    res.json({ ok: true });
+  // Si ese nombre aún no existe en la DB, lo inicializamos
+  if (!namingDb[name]) namingDb[name] = [];
+
+  // Agregamos la nueva entrada al array de ese nombre
+  namingDb[name].push({ host, port, iface });
+
+  console.log(`[NamingServer:${PORT}] Registrado: ${name} -> ${host}:${port}`);
+
+  res.json({ status: "ok" });
 });
 
-/*
-  Endpoint: POST /unregister
-  Body esperado: { name, host, port }
-  Acción: elimina la instancia concreta del registro (si coinciden host y port).
+/* 
+  ============================
+  ENDPOINT: LOOKUP
+  ============================
+  GET /lookup/:name
+  Busca un servicio dado su nombre.
+  1) Primero revisa la base de datos local
+  2) Si no lo encuentra, consulta a los otros naming servers configurados
 */
-app.post("/unregister", (req, res) => {
-  const { name, host, port } = req.body;
-  if (!name) return res.status(400).send("missing name");
+app.get("/lookup/:name", async (req, res) => {
+  const { name } = req.params;
 
-  // Filtramos la lista removiendo la instancia que coincide con host y port
-  const arr = (registry.get(name) || []).filter(en => !(en.host === host && en.port === port));
+  // Paso 1: búsqueda local
+  const entries = namingDb[name];
+  if (entries) {
+    return res.json({ entries });
+  }
 
-  // Si quedaron instancias se actualiza, si no, se borra la clave
-  if (arr.length) registry.set(name, arr); else registry.delete(name);
-  res.json({ ok: true });
-});
-
-/*
-  Endpoint: GET /lookup/:name
-  Acción: búsqueda exacta del nombre. Devuelve las instancias activas de ese nombre.
-  Aplica filtro TTL (si una entrada tiene ttl y expiró, se la excluye del resultado).
-*/
-app.get("/lookup/:name", (req, res) => {
-  const name = req.params.name;
-  const entries = registry.get(name) || [];
-
-  // Filtrar expirados según ttl
-  const now = Date.now();
-  const filtered = entries.filter(e => !e.ttl || (now - e.registeredAt) < (e.ttl * 1000));
-
-  res.json({ name, entries: filtered });
-});
-
-/*
-  Endpoint: GET /resolve/:name
-  Acción: búsqueda jerárquica. Si no existe coincidencia exacta para "a.b.c.d",
-  intenta subir en el árbol: "a.b.c", "a.b", "a" y devuelve la primera coincidencia encontrada.
-  Esto permite delegación / fallback por prefijo.
-*/
-app.get("/resolve/:name", (req, res) => {
-  let name = req.params.name;
-  const parts = name.split(".");
-
-  // Se recorre desde el candidate más específico hasta el menos (subiendo en la jerarquía)
-  for (let i = parts.length; i >= 1; i--) {
-    const candidate = parts.slice(0, i).join(".");
-    const entries = registry.get(candidate) || [];
-    if (entries.length) {
-      return res.json({ name: candidate, entries });
+  // Paso 2: búsqueda en otros servidores
+  for (const server of otherNamingServers) {
+    try {
+      const r = await fetch(`${server}/lookup/${encodeURIComponent(name)}`);
+      if (r.ok) {
+        const json = await r.json();
+        if (json.entries && json.entries.length > 0) {
+          console.log(`[NamingServer:${PORT}] Redirigido a ${server} para ${name}`);
+          return res.json(json);
+        }
+      }
+    } catch (e) {
+      console.error(`[NamingServer:${PORT}] Error consultando a ${server}:`, e);
     }
   }
 
-  // Si no se encontró nada, 404
-  return res.status(404).json({ error: "not found" });
+  // Paso 3: si nadie lo tiene, devolvemos lista vacía
+  res.json({ entries: [] });
 });
 
-/*
-  Endpoint: GET /list
-  Acción: devuelve todo el contenido del registro (útil para debug / pruebas).
+/* 
+  ============================
+  ENDPOINT: RESOLVE
+  ============================
+  Es prácticamente igual que lookup, pero lo dejamos separado
+  para simular una API alternativa (en algunos sistemas se diferencia lookup/resolve).
 */
-app.get("/list", (req, res) => {
-  const obj: any = {};
-  for (const [k, v] of registry.entries()) obj[k] = v;
-  res.json(obj);
+app.get("/resolve/:name", async (req, res) => {
+  const { name } = req.params;
+
+  const entries = namingDb[name];
+  if (entries) {
+    return res.json({ entries });
+  }
+
+  for (const server of otherNamingServers) {
+    try {
+      const r = await fetch(`${server}/resolve/${encodeURIComponent(name)}`);
+      if (r.ok) {
+        const json = await r.json();
+        if (json.entries && json.entries.length > 0) {
+          console.log(`[NamingServer:${PORT}] Redirigido a ${server} para ${name}`);
+          return res.json(json);
+        }
+      }
+    } catch (e) {
+      console.error(`[NamingServer:${PORT}] Error consultando a ${server}:`, e);
+    }
+  }
+
+  res.json({ entries: [] });
 });
 
-
-// Se arranca el servidor
-app.listen(PORT, () => console.log(`Naming server listening on ${PORT}`));
+// Finalmente, levantamos el servidor en el puerto configurado
+app.listen(PORT, () => {
+  console.log(`Naming server escuchando en puerto ${PORT}`);
+});
